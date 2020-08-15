@@ -1,0 +1,44 @@
+version: '2'
+services:
+    mongodb:
+        image: mongo:latest
+        container_name: mongodb
+        ports:
+            - 27017:27017
+    fastocloud_admin:
+        build:
+            context: ./
+            dockerfile: Dockerfile
+        image: fastocloud_admin
+        container_name: fastocloud_admin
+        depends_on:
+            - mongodb
+        command: ./server.py
+        ports:
+            - 8081:8081
+    fastocloud:
+        image: fastogt/fastocloud
+        container_name: fastocloud
+        ports:
+            - 6001:6001
+            - 6317:6317
+            - 7000:7000
+            - 8000:8000
+    fastocloud_load_balance:
+        image: fastogt/fastocloud_load_balance
+        container_name: fastocloud_load_balance
+        depends_on:
+            - mongodb
+        ports:
+            - 5001:5001
+            - 5317:5317
+            - 6000:6000
+    nginx:
+        image: nginx
+        container_name: nginx
+        depends_on:
+            - fastocloud_admin
+        volumes:
+            - ./docker/nginx.conf:/etc/nginx/nginx.conf
+        ports:
+            - 80:80

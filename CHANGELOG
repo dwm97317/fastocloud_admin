@@ -1,0 +1,38 @@
+1.1.1 / May 4, 2020
+[Alexandr Topilski]
+- Sync with pfastocloud(1.1.0) and pyfastocloud_models(1.1.0)
+
+1.1.0 / April 21, 2020
+[Alexandr Topilski]
+- New models
+- UDP iface
+- Program number
+- gevent websockets
+
+1.0.0 / February 9, 2020
+[Alexandr Topilski]
+- Catchups
+- Machine Learning integration
+- Epg handling
+- Events streams
+- Vods proxy
+- Series
+- Stream quality
+- Import subscribers from Xtream script
+- Display OS
+- Online services streams
+- Channels on demand
+- Subscribers page
+- Providers page
+- User online
+- Tvg fields
+- User agents
+- Proxy streams
+- Icons for streams
+- Play stream button
+- User type
+- More user friendlt UI
+- Service version
+- Playlist generation
+- Avformat streams
+- Roles
