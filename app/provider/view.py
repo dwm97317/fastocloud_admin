@@ -13,7 +13,7 @@ class ProviderView(FlaskView):
     def dashboard(self):
         server = current_user.get_current_server()
         if server:
-            streams = server.get_streams()
+            streams = server.streams
             streams_relay_encoder_timeshifts = []
             vods = []
             cods = []

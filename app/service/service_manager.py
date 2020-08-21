@@ -28,7 +28,7 @@ class ServiceManager(object):
             if server.id == settings.id:
                 return server
 
-        server = Service(self._host, self._port, self._socketio, settings)
+        server = Service(self._socketio, settings)
         self.__add_server(server)
         return server
 

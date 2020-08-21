@@ -1,91 +1,83 @@
+import logging
 from datetime import datetime
 
 import pyfastocloud_models.constants as constants
+from app.service.service_client import ServiceClientPanel
 from bson.objectid import ObjectId
-from pyfastocloud.client_constants import ClientStatus
-from pyfastocloud_models.provider.entry_pair import ProviderPair
-from pyfastocloud_models.service.entry import ServiceSettings
+from pyfastocloud.client_constants import ClientStatus, RequestReturn
+from pyfastocloud.json_rpc import Response
+from pyfastocloud_models.machine_entry import Machine
+from pyfastocloud_models.series.entry import Serial
+from pyfastocloud_models.service.entry import ServiceSettings, ProviderPair
 from pyfastocloud_models.stream.entry import IStream
 from pyfastocloud_models.utils.utils import date_to_utc_msec
+from pyfastocloud_node.service.service_client import OnlineUsers
+from pyfastocloud_node.service.stream_handler import IStreamHandler
+from pyfastocloud_node.structs import OperationSystem
 
-from app.service.service_client import ServiceClient, OperationSystem, RequestReturn
 from app.service.stream import IStreamObject, ProxyStreamObject, ProxyVodStreamObject, RelayStreamObject, \
     VodRelayStreamObject, EncodeStreamObject, VodEncodeStreamObject, TimeshiftRecorderStreamObject, \
     TimeshiftPlayerStreamObject, CatchupStreamObject, EventStreamObject, CodEncodeStreamObject, CodRelayStreamObject, \
     TestLifeStreamObject
-from app.service.stream_handler import IStreamHandler
-
-
-class OnlineUsers(object):
-    __slots__ = ['daemon', 'http', 'vods', 'cods', 'subscribers']
-
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            if key in self.__slots__:
-                setattr(self, key, value)
-
-    def __str__(self):
-        if hasattr(self, 'subscribers'):
-            return 'daemon:{0} http:{1} vods:{2} cods:{3} subscribers:{4}'.format(self.daemon, self.http, self.vods,
-                                                                                  self.cods, self.subscribers)
-
-        return 'daemon:{0} http:{1} vods:{2} cods:{3}'.format(self.daemon, self.http, self.vods, self.cods)
 
 
 class ServiceFields:
     ID = 'id'
-    CPU = 'cpu'
-    GPU = 'gpu'
-    LOAD_AVERAGE = 'load_average'
-    MEMORY_TOTAL = 'memory_total'
-    MEMORY_FREE = 'memory_free'
-    HDD_TOTAL = 'hdd_total'
-    HDD_FREE = 'hdd_free'
-    BANDWIDTH_IN = 'bandwidth_in'
-    BANDWIDTH_OUT = 'bandwidth_out'
     PROJECT = 'project'
     VERSION = 'version'
-    EXP_TIME = 'exp_time'
-    UPTIME = 'uptime'
+    EXP_TIME = 'expiration_time'
     SYNCTIME = 'synctime'
-    TIMESTAMP = 'timestamp'
-    STATUS = 'status'
     ONLINE_USERS = 'online_users'
+    STATUS = 'status'
     OS = 'os'
 
 
 class Service(IStreamHandler):
-    SERVER_ID = 'server_id'
-    STREAM_DATA_CHANGED = 'stream_data_changed'
+    SOCKETIO_NAMESPACE = '/service'
+
     SERVICE_DATA_CHANGED = 'service_data_changed'
-    INIT_VALUE = 0
+    STREAM_ADDED = 'stream_added'
+    STREAM_UPDATED = 'stream_updated'
+    STREAM_REMOVED = 'stream_removed'
+    STREAM_ML_NOTIFICATION = 'stream_ml_notification'
+    SERIAL_ADDED = 'serial_added'
+    SERIAL_UPDATED = 'serial_updated'
+    SERIAL_REMOVED = 'serial_removed'
+    SERVICE_RPC = 'rpc'
+    OID = 'oid'
+    PARAMS = 'params'
+
+    DUMP_STATS_TIME_MSEC = 60000
     CALCULATE_VALUE = None
 
     # runtime
-    _cpu = INIT_VALUE
-    _gpu = INIT_VALUE
-    _load_average = CALCULATE_VALUE
-    _memory_total = INIT_VALUE
-    _memory_free = INIT_VALUE
-    _hdd_total = INIT_VALUE
-    _hdd_free = INIT_VALUE
-    _bandwidth_in = INIT_VALUE
-    _bandwidth_out = INIT_VALUE
-    _uptime = CALCULATE_VALUE
+    _monitoring_timestamp = 0
+    _machine = Machine.default()
     _sync_time = CALCULATE_VALUE
-    _timestamp = CALCULATE_VALUE
+    _online_clients = OnlineUsers.default()
     _streams = []
-    _online_users = None
-    _os = OperationSystem()
 
-    def __init__(self, host, port, socketio, settings: ServiceSettings):
+    def __init__(self, socketio, settings: ServiceSettings):
         self._settings = settings
         # other fields
-        self._client = ServiceClient(settings.id, settings.host.host, settings.host.port, self)
-        self._host = host
-        self._port = port
+        self._client = ServiceClientPanel(settings.id, settings.host.host, settings.host.port, self)
         self._socketio = socketio
         self.__reload_from_db()
+
+    def auto_start(self):
+        if not self._settings.auto_start:
+            return
+
+        self.connect()
+        if self._settings.activation_key:
+            self.activate(self._settings.activation_key)
+
+            for stream in self.streams:
+                stream.auto_start()
+
+    @property
+    def settings(self):
+        return self._settings
 
     def connect(self):
         return self._client.connect()
@@ -105,8 +97,8 @@ class Service(IStreamHandler):
     def stop(self, delay: int) -> RequestReturn:
         return self._client.stop_service(delay)
 
-    def get_log_service(self) -> RequestReturn:
-        return self._client.get_log_service(self._host, self._port)
+    def get_log(self, route: str) -> RequestReturn:
+        return self._client.get_log_service(route)
 
     def ping(self) -> RequestReturn:
         return self._client.ping_service()
@@ -116,45 +108,60 @@ class Service(IStreamHandler):
 
     def sync(self, prepare=False) -> RequestReturn:
         if prepare:
-            self._client.prepare_service(self._settings)
-        res, seq = self._client.sync_service(self._streams)
+            self._client.prepare_service(self._settings.feedback_directory, self._settings.timeshifts_directory,
+                                         self._settings.hls_directory, self._settings.vods_directory,
+                                         self._settings.cods_directory, self._settings.proxy_directory)
+        res, oid = self._client.sync_service(self._streams)
         self.__refresh_catchups()
         if res:
             self._sync_time = datetime.now()
-        return res, seq
+        return res, oid
 
-    def get_log_stream(self, sid: ObjectId):
+    def get_log_stream(self, sid: ObjectId, route: str) -> RequestReturn:
         stream = self.find_stream_by_id(sid)
-        if stream:
-            stream.get_log_request(self._host, self._port)
+        if not stream:
+            return False, None
 
-    def get_pipeline_stream(self, sid: ObjectId):
-        stream = self.find_stream_by_id(sid)
-        if stream:
-            stream.get_pipeline_request(self._host, self._port)
+        return stream.get_log_request(route)
 
-    def start_stream(self, sid: ObjectId):
+    def get_pipeline_stream(self, sid: ObjectId, route: str) -> RequestReturn:
         stream = self.find_stream_by_id(sid)
-        if stream:
-            stream.start_request()
+        if not stream:
+            return False, None
 
-    def stop_stream(self, sid: ObjectId):
-        stream = self.find_stream_by_id(sid)
-        if stream:
-            stream.stop_request()
+        return stream.get_pipeline_request(route)
 
-    def restart_stream(self, sid: ObjectId):
+    def start_stream(self, sid: ObjectId) -> RequestReturn:
         stream = self.find_stream_by_id(sid)
-        if stream:
-            stream.restart_request()
+        if not stream:
+            return False, None
+
+        return stream.start_request()
+
+    def stop_stream(self, sid: ObjectId) -> RequestReturn:
+        stream = self.find_stream_by_id(sid)
+        if not stream:
+            return False, None
+
+        return stream.stop_request()
+
+    def restart_stream(self, sid: ObjectId) -> RequestReturn:
+        stream = self.find_stream_by_id(sid)
+        if not stream:
+            return False, None
+
+        return stream.restart_request()
+
+    def get_id(self):
+        return str(self.id)
 
     @property
-    def settings(self) -> ServiceSettings:
-        return self._settings
+    def room(self) -> str:
+        return str(self.id)
 
     @property
-    def host(self) -> str:
-        return self._host
+    def namespace(self) -> str:
+        return '{0}_{1}'.format(Service.SOCKETIO_NAMESPACE, self.id)
 
     @property
     def id(self) -> ObjectId:
@@ -166,53 +173,53 @@ class Service(IStreamHandler):
 
     @property
     def cpu(self):
-        return self._cpu
+        return self._machine.cpu
 
     @property
     def gpu(self):
-        return self._gpu
+        return self._machine.gpu
 
     @property
     def load_average(self):
-        return self._load_average
+        return self._machine.load_average
 
     @property
     def memory_total(self):
-        return self._memory_total
+        return self._machine.memory_total
 
     @property
     def memory_free(self):
-        return self._memory_free
+        return self._machine.memory_free
 
     @property
     def hdd_total(self):
-        return self._hdd_total
+        return self._machine.hdd_total
 
     @property
     def hdd_free(self):
-        return self._hdd_free
+        return self._machine.memory_free
 
     @property
     def bandwidth_in(self):
-        return self._bandwidth_in
+        return self._machine.bandwidth_in
 
     @property
     def bandwidth_out(self):
-        return self._bandwidth_out
+        return self._machine.bandwidth_out
 
     @property
     def uptime(self):
-        return self._uptime
+        return self._machine.uptime
 
     @property
     def synctime(self):
-        if not self._sync_time:
-            return None
+        if self._sync_time == Service.CALCULATE_VALUE:
+            return Service.CALCULATE_VALUE
         return date_to_utc_msec(self._sync_time)
 
     @property
     def timestamp(self):
-        return self._timestamp
+        return self._machine.timestamp
 
     @property
     def project(self) -> str:
@@ -236,9 +243,10 @@ class Service(IStreamHandler):
 
     @property
     def online_users(self) -> OnlineUsers:
-        return self._online_users
+        return self._online_clients
 
-    def get_streams(self):
+    @property
+    def streams(self):
         return self._streams
 
     def find_stream_by_id(self, sid: ObjectId) -> IStreamObject:
@@ -248,6 +256,9 @@ class Service(IStreamHandler):
 
         return None  #
 
+    def generate_playlist(self):
+        return self._settings.generate_playlist()
+
     def get_user_role_by_id(self, uid: ObjectId) -> ProviderPair.Roles:
         for user in self._settings.providers:
             if user.user.id == uid:
@@ -255,45 +266,102 @@ class Service(IStreamHandler):
 
         return ProviderPair.Roles.READ
 
-    def add_stream(self, stream: IStream):
-        if stream:
-            stream_object = self.__convert_stream(stream)
-            self._streams.append(stream_object)
-            self._settings.add_stream(stream)
-            self._settings.save()
-
-    def add_streams(self, streams: [IStream]):
-        stabled_streams = []
-        for stream in streams:
-            if stream:
-                stream_object = self.__convert_stream(stream)
-                self._streams.append(stream_object)
-                stabled_streams.append(stream)
-
-        self._settings.add_streams(stabled_streams)  #
+    def add_provider(self, provider: ProviderPair):
+        self._settings.add_provider(provider)
         self._settings.save()
 
+        provider.user.add_server(self._settings)
+        provider.user.save()
+
+    def remove_provider(self, provider):
+        self._settings.remove_provider(provider)
+        self._settings.save()
+
+        provider.remove_server(self._settings)
+        provider.save()
+
+    def add_stream_by_id(self, sid: ObjectId) -> IStreamObject:
+        stream = IStream.get_by_id(sid)
+        return self.add_stream(stream)
+
+    def get_series(self) -> [Serial]:
+        return self._settings.series
+
+    def add_serial(self, serial: Serial):
+        if not serial:
+            return None
+
+        self._settings.add_serial(serial)
+        self._settings.save()
+        self._notify_serial_added(serial)
+        return serial
+
+    def update_serial(self, serial: Serial):
+        if not serial:
+            return None
+
+        serial.save()
+        # self._settings.refresh_from_db(['series'])
+        self._notify_serial_updated(serial)
+
+    def remove_serial(self, sid: ObjectId):
+        serial = Serial.get_by_id(sid)
+        if serial:
+            self._settings.remove_serial(serial)
+            self._settings.save()
+            self._notify_serial_removed(serial)
+
+    def add_stream(self, stream: IStream):
+        if not stream:
+            return None
+
+        stream_object = self.__convert_stream(stream)
+        self._streams.append(stream_object)
+        self._settings.add_stream(stream)
+        self._settings.save()
+        self._notify_stream_added(stream_object)
+        return stream_object
+
     def update_stream(self, stream: IStream):
-        stream.save(self.settings)
+        if not stream:
+            return None
+
+        stream.save(self._settings)
+        stream_object = self.find_stream_by_id(stream.id)
+        if not stream_object:
+            return None
+
+        stream_object._stream = stream
+        self._notify_stream_updated(stream_object)
 
     def remove_stream(self, sid: ObjectId):
-        for stream in list(self._streams):
+        copy = list(self._streams)
+        for stream in copy:
             if stream.id == sid:
-                original = stream.stream()
-                for part in list(original.parts):
-                    self.remove_stream(part.id)
-
                 stream.stop_request()
                 self._streams.remove(stream)
-                self._settings.remove_stream(original)
+                istream = stream.stream()
+                self._settings.remove_stream(istream)
+                self._notify_stream_removed(stream)
         self._settings.save()
 
     def remove_all_streams(self):
-        for stream in self._streams:
-            self._client.stop_stream(stream.get_id())
+        copy = list(self._streams)
         self._streams = []
+        for stream in copy:
+            self._client.stop_stream(stream.get_id())
+            self._notify_stream_removed(stream)
         self._settings.remove_all_streams()  #
         self._settings.save()
+
+    def probe_stream(self, url: str) -> RequestReturn:
+        return self._client.probe_stream(url)
+
+    def scan_folder(self, directory: str, extensions: list) -> RequestReturn:
+        return self._client.scan_folder(directory, extensions)
+
+    def scan_folder_vods(self, directory: str, extensions: list, default_icon: str) -> RequestReturn:
+        return self._client.scan_folder_vods(directory, extensions, default_icon)
 
     def stop_all_streams(self):
         for stream in self._streams:
@@ -303,16 +371,18 @@ class Service(IStreamHandler):
         for stream in self._streams:
             self._client.start_stream(stream.config())
 
-    def to_dict(self) -> dict:
-        return {ServiceFields.ID: str(self.id), ServiceFields.CPU: self._cpu, ServiceFields.GPU: self._gpu,
-                ServiceFields.LOAD_AVERAGE: self._load_average, ServiceFields.MEMORY_TOTAL: self._memory_total,
-                ServiceFields.MEMORY_FREE: self._memory_free, ServiceFields.HDD_TOTAL: self._hdd_total,
-                ServiceFields.HDD_FREE: self._hdd_free, ServiceFields.BANDWIDTH_IN: self._bandwidth_in,
-                ServiceFields.BANDWIDTH_OUT: self._bandwidth_out, ServiceFields.PROJECT: self.project,
-                ServiceFields.VERSION: self.version, ServiceFields.EXP_TIME: self.exp_time,
-                ServiceFields.UPTIME: self._uptime, ServiceFields.SYNCTIME: self.synctime,
-                ServiceFields.TIMESTAMP: self._timestamp, ServiceFields.STATUS: self.status,
-                ServiceFields.ONLINE_USERS: str(self.online_users), ServiceFields.OS: str(self.os)}
+    def to_front_dict(self) -> dict:
+        settings_front = self._settings.to_front_dict()
+        os = self.os.to_dict() if self.os else None
+
+        settings_front[ServiceFields.VERSION] = self.version
+        settings_front[ServiceFields.PROJECT] = self.project
+        settings_front[ServiceFields.EXP_TIME] = self.exp_time
+        settings_front[ServiceFields.SYNCTIME] = self.synctime
+        settings_front[ServiceFields.STATUS] = self.status
+        settings_front[ServiceFields.ONLINE_USERS] = self.online_users.to_dict()
+        settings_front[ServiceFields.OS] = os
+        return {**settings_front, **self._machine.to_front_dict()}
 
     def make_proxy_stream(self) -> ProxyStreamObject:
         return ProxyStreamObject.make_stream(self._settings)
@@ -354,30 +424,54 @@ class Service(IStreamHandler):
         return TestLifeStreamObject.make_stream(self._settings, self._client)
 
     # handler
+    def _notify_serial_added(self, serial: Serial):
+        self.__notify_front(Service.SERIAL_ADDED, serial.to_front_dict())
+
+    def _notify_serial_updated(self, serial: Serial):
+        self.__notify_front(Service.SERIAL_UPDATED, serial.to_front_dict())
+
+    def _notify_serial_removed(self, serial: Serial):
+        self.__notify_front(Service.SERIAL_REMOVED, serial.to_front_dict())
+
+    def _notify_stream_added(self, stream: IStreamObject):
+        self.__notify_front(Service.STREAM_ADDED, stream.to_front_dict())
+
+    def _notify_stream_updated(self, stream: IStreamObject):
+        self.__notify_front(Service.STREAM_UPDATED, stream.to_front_dict())
+
+    def _notify_stream_removed(self, stream: IStreamObject):
+        self.__notify_front(Service.STREAM_REMOVED, stream.to_front_dict())
+
+    def _notify_stream_ml_notification(self, stream: IStreamObject):
+        self.__notify_front(Service.STREAM_ML_NOTIFICATION, stream.to_front_dict())
+
     def on_stream_statistic_received(self, params: dict):
         sid = params['id']
         stream = self.find_stream_by_id(ObjectId(sid))
         if stream:
             stream.update_runtime_fields(params)
-            self.__notify_front(Service.STREAM_DATA_CHANGED, stream.to_front_dict())
+            self._notify_stream_updated(stream)
 
     def on_stream_sources_changed(self, params: dict):
         pass
 
     def on_stream_ml_notification(self, params: dict):
-        pass
+        sid = params['id']
+        stream = self.find_stream_by_id(ObjectId(sid))
+        if stream:
+            self._notify_stream_ml_notification(stream)
 
     def on_service_statistic_received(self, params: dict):
         # nid = params['id']
         self.__refresh_stats(params)
-        self.__notify_front(Service.SERVICE_DATA_CHANGED, self.to_dict())
+        self.__refresh_front()
 
     def on_quit_status_stream(self, params: dict):
         sid = params['id']
         stream = self.find_stream_by_id(ObjectId(sid))
         if stream:
             stream.reset()
-            self.__notify_front(Service.STREAM_DATA_CHANGED, stream.to_front_dict())
+            self._notify_stream_updated(stream)
 
     def on_client_state_changed(self, status: ClientStatus):
         if status == ClientStatus.ACTIVE:
@@ -386,69 +480,62 @@ class Service(IStreamHandler):
             self.__reset()
             for stream in self._streams:
                 stream.reset()
+        self.__refresh_front()
 
     def on_ping_received(self, params: dict):
         self.sync()
 
+    def on_probe_stream(self, rpc: Response):
+        self.__notify_front(Service.SERVICE_RPC, rpc.to_dict())
+
+    def on_scan_folder(self, rpc: Response):
+        self.__notify_front(Service.SERVICE_RPC, rpc.to_dict())
+
+    def on_scan_folder_vods(self, rpc: Response):
+        self.__notify_front(Service.SERVICE_RPC, rpc.to_dict())
+
     # private
-    def __notify_front(self, channel: str, params: dict):
-        unique_channel = channel + '_' + str(self.id)
-        self._socketio.emit(unique_channel, params)
+    def __refresh_front(self):
+        self.__notify_front(Service.SERVICE_DATA_CHANGED, self.to_front_dict())
+
+    def __notify_front(self, channel: str, json: dict):
+        self._socketio.emit(channel, json, namespace=self.namespace)
 
     def __reset(self):
-        self._cpu = Service.INIT_VALUE
-        self._gpu = Service.INIT_VALUE
-        self._load_average = Service.CALCULATE_VALUE
-        self._memory_total = Service.INIT_VALUE
-        self._memory_free = Service.INIT_VALUE
-        self._hdd_total = Service.INIT_VALUE
-        self._hdd_free = Service.INIT_VALUE
-        self._bandwidth_in = Service.INIT_VALUE
-        self._bandwidth_out = Service.INIT_VALUE
-        self._uptime = Service.CALCULATE_VALUE
+        self._machine = Machine.default()
         self._sync_time = Service.CALCULATE_VALUE
-        self._timestamp = Service.CALCULATE_VALUE
-        self._online_users = None
+        self._online_clients = OnlineUsers.default()
 
     def __refresh_stats(self, stats: dict):
-        self._cpu = stats[ServiceFields.CPU]
-        self._gpu = stats[ServiceFields.GPU]
-        self._load_average = stats[ServiceFields.LOAD_AVERAGE]
-        self._memory_total = stats[ServiceFields.MEMORY_TOTAL]
-        self._memory_free = stats[ServiceFields.MEMORY_FREE]
-        self._hdd_total = stats[ServiceFields.HDD_TOTAL]
-        self._hdd_free = stats[ServiceFields.HDD_FREE]
-        self._bandwidth_in = stats[ServiceFields.BANDWIDTH_IN]
-        self._bandwidth_out = stats[ServiceFields.BANDWIDTH_OUT]
-        self._uptime = stats[ServiceFields.UPTIME]
-        self._timestamp = stats[ServiceFields.TIMESTAMP]
-        self._online_users = OnlineUsers(**stats[ServiceFields.ONLINE_USERS])
+        self._machine = Machine.make_entry(stats)
+        self._online_clients = OnlineUsers(**stats[ServiceFields.ONLINE_USERS])
+        if self._settings.monitoring:
+            curts = self._machine.timestamp
+            need_shot = (curts - self._monitoring_timestamp) > Service.DUMP_STATS_TIME_MSEC
+            if need_shot:
+                self._settings.add_stat(self._machine)
+                self._settings.save()
+                self._monitoring_timestamp = curts
 
     def __reload_from_db(self):
         self._streams = []
-        for stream in self._settings.streams:
-            stream_object = self.__convert_stream(stream)
-            if stream_object:
-                self._streams.append(stream_object)
+        settings = self._settings
+        for i, stream in enumerate(settings.streams):
+            if stream:
+                stream_object = self.__convert_stream(stream)
+                if stream_object:
+                    self._streams.append(stream_object)
+                else:
+                    logging.warning('Failed to create stream object: %s', stream.get_id())
+            else:
+                logging.warning('Invalid stream in service: %s, position: %d', settings.get_id(), i)
 
     def __refresh_catchups(self):
-        self._settings.refresh_from_db()
-        # FIXME workaround, need to listen load balance
-        for stream in self._settings.streams:
-            if stream and stream.get_type() == constants.StreamType.CATCHUP:
-                if not self.find_stream_by_id(stream.pk):
-                    stream_object = self.__convert_stream(stream)
-                    if stream_object:
-                        self._streams.append(stream_object)
-
         for stream in self._streams:
             if stream.type == constants.StreamType.CATCHUP:
                 stream.start_request()
 
     def __convert_stream(self, stream: IStream) -> IStreamObject:
-        if not stream:
-            return
-
         stream_type = stream.get_type()
         if stream_type == constants.StreamType.PROXY:
             return ProxyStreamObject(stream, self._settings)
