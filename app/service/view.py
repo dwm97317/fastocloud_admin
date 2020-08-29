@@ -36,7 +36,8 @@ class ServiceView(FlaskView):
             files = request.files.getlist("files")
             for file in files:
                 m3u_parser = M3uParser()
-                data = file.read().decode('utf-8')
+                read = file.read()
+                data = read.decode(encoding='utf-8', errors='ignore')
                 m3u_parser.load_content(data)
                 m3u_parser.parse()
 
