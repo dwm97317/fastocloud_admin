@@ -120,9 +120,7 @@ class ServiceView(FlaskView):
                     is_valid_stream = stream.is_valid()
                     if is_valid_stream:
                         stream.save(server.settings)
-                        streams.append(stream)
-
-                server.add_streams(streams)
+                        server.add_stream(stream)
 
         return redirect(url_for('ProviderView:dashboard'))
 
